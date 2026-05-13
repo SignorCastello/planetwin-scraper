@@ -1,5 +1,4 @@
 '''almeno una Under è < 2.5 e almeno una Over è > 1.5'''
-
 import multiprocessing
 multiprocessing.freeze_support()
 
@@ -168,14 +167,7 @@ def ensure_chromium():
     splash.run()
 
 app = Flask(__name__, template_folder=resource_path('templates'), static_folder=resource_path('static'))
-
-LEAGUES = [
-    {"name": "Serie A", "url": "https://www.planetwin365.it/scommesse/sport/calcio/italia/serie-a?did=1&nid=1577&eid=93"},
-    {"name": "Serie B", "url": "https://www.planetwin365.it/scommesse/sport/calcio/italia/serie-b?did=1&nid=1577&eid=1626630"},
-    {"name": "Coppa Italia", "url": "https://www.planetwin365.it/scommesse/sport/calcio/italia/coppa-italia?did=1&nid=1577&eid=9683"},
-]
-
-last_request_time = time.time()
+last_req = time.time()
 
 @app.before_request
 def update_last_request_time():
@@ -184,88 +176,90 @@ def update_last_request_time():
 
 async def get_match_names(page):
     return await page.evaluate("""() => {
-        const results = [];
-        const seen = new Set();
+        const res = []; const seen = new Set();
         document.querySelectorAll('*').forEach(el => {
             if (!Array.from(el.childNodes).some(n => n.nodeName === 'BR')) return;
             const lines = el.innerText.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 1);
             if (lines.length !== 2) return;
             const key = lines[0] + '|' + lines[1];
-            if (!seen.has(key)) {
-                seen.add(key);
-                results.push(lines[0] + ' - ' + lines[1]);
-            }
+            if (!seen.has(key)) { seen.add(key); res.push(lines[0] + ' - ' + lines[1]); }
         });
-        return results;
+        return res;
     }""")
 
 async def get_quote(container, label):
     try:
         text = await container.locator("div.container_quota").filter(has_text=label).locator(".item--valore").inner_text()
         return float(text.replace(',', '.'))
-    except:
-        return None
+    except: return None
 
-async def switch_spread(page, container, value):
+async def switch_spread(page, container, val):
     try:
-        dropdown = container.locator("button.spread-btn")
-        await dropdown.click()
+        await container.locator("button.spread-btn").click()
         await asyncio.sleep(0.3)
-        await page.locator(".btn-group.show .dropdown-item, .spread-item, li").get_by_text(value, exact=True).first.click()
+        await page.locator(".btn-group.show .dropdown-item, .spread-item, li").get_by_text(val, exact=True).first.click()
         await asyncio.sleep(0.5)
-    except:
-        pass
+    except: pass
+
+async def get(context):
+    page = await context.new_page()
+    leagues = []
+    try:
+        await page.goto("https://www.planetwin365.it/scommesse/sport/", wait_until="domcontentloaded", timeout=45000)
+        await page.click("text=Tutti", timeout=5000)
+        await asyncio.sleep(2)
+        links = await page.locator("a[href*='/calcio/']").all()
+        for link in links:
+            url = await link.get_attribute("href")
+            name = await link.inner_text()
+            if url and "/calcio/" in url and len(name.strip()) > 2:
+                full_url = "https://www.planetwin365.it" + url if url.startswith("/") else url
+                leagues.append({"name": name.strip(), "url": full_url})
+    except: pass
+    finally: await page.close()
+    unique = {l['url']: l for l in leagues}.values()
+    return list(unique)
+
+async def scrape_league(context, league, sem):
+    async with sem:
+        res = []
+        page = await context.new_page()
+        try:
+            await page.goto(league["url"], wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_selector("app-scommesse-spread-layout", timeout=10000)
+            matches = await get_match_names(page)
+            containers = await page.locator("app-scommesse-spread-layout").all()
+            for i in range(len(containers)):
+                c = page.locator("app-scommesse-spread-layout").nth(i)
+                name = matches[i] if i < len(matches) else "N/D"
+                try:
+                    u25, o25 = await get_quote(c, "U"), await get_quote(c, "O")
+                    await switch_spread(page, c, "1.5")
+                    u15, o15 = await get_quote(c, "U"), await get_quote(c, "O")
+                    if any(q is not None for q in [u25, o25, u15, o15]):
+                        res.append({"id": i, "league": league["name"], "match": name, "under_15": u15, "under_25": u25, "over_15": o15, "over_25": o25})
+                except: continue
+        except: pass
+        finally: await page.close()
+        return res
 
 async def run_scraper():
-    chromium_exe = get_chromium_path()
-    if not chromium_exe:
-        return [{"error": "Chromium non trovato. Riavvia l'applicazione."}]
-    results = []
+    exe = get_chromium_path()
+    if not exe: return [{"error": "Browser non trovato"}]
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            executable_path=chromium_exe,
-            args=["--headless=new", "--disable-blink-features=AutomationControlled"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        for league in LEAGUES:
-            page = await context.new_page()
-            try:
-                await page.goto(league["url"], wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_selector("app-scommesse-spread-layout", timeout=15000)
-                match_names = await get_match_names(page)
-                items = await page.locator("app-scommesse-spread-layout").all()
-                for i in range(len(items)):
-                    container = page.locator("app-scommesse-spread-layout").nth(i)
-                    match_name = match_names[i] if i < len(match_names) else "N/D"
-                    try:
-                        under_25 = await get_quote(container, "U")
-                        over_25  = await get_quote(container, "O")
-                        await switch_spread(page, container, "1.5")
-                        under_15 = await get_quote(container, "U")
-                        over_15  = await get_quote(container, "O")
-                        await switch_spread(page, container, "2.5")
-                        if (any(q is not None and q < 2.5 for q in [under_15, under_25]) and
-                                any(q is not None and q > 1.5 for q in [over_15, over_25])):
-                            results.append({
-                                "id": i + 1, "league": league["name"], "match": match_name,
-                                "under_15": under_15, "under_25": under_25,
-                                "over_15": over_15,  "over_25": over_25,
-                            })
-                    except:
-                        continue
-            except:
-                continue
-            finally:
-                await page.close()
+        browser = await p.chromium.launch(headless=True, executable_path=exe, args=["--headless=new", "--disable-blink-features=AutomationControlled"])
+        #browser = await p.chromium.launch(headless=False, executable_path=exe, args=["--disable-blink-features=AutomationControlled"])
+        #debug!!
+        ctx = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        leagues = await get(ctx)
+        sem = asyncio.Semaphore(5)
+        tasks = [scrape_league(ctx, l, sem) for l in leagues]
+        nested = await asyncio.gather(*tasks)
         await browser.close()
-    return results
+        return [item for sub in nested for item in sub]
 
 @app.route('/')
-def index():
-    return render_template('index.html')
+def index(): return render_template('index.html')
 
 @app.route('/start-scrape')
 def start_scrape():
@@ -280,7 +274,7 @@ def open_browser():
     time.sleep(1.5)
     webbrowser.open("http://127.0.0.1:8080")
 
-def shutdown_monitor():
+def monitor():
     while True:
         time.sleep(5)
         if time.time() - last_request_time > 300:
@@ -289,5 +283,5 @@ def shutdown_monitor():
 if __name__ == "__main__":
     ensure_chromium()
     threading.Thread(target=open_browser, daemon=True).start()
-    threading.Thread(target=shutdown_monitor, daemon=True).start()
-    serve(app, host='127.0.0.1', port=8080, threads=6)
+    threading.Thread(target=monitor, daemon=True).start()
+    serve(app, host='127.0.0.1', port=8080, threads=8)
